@@ -19,10 +19,36 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Allowed frontend origins
+// Allowed frontend origins
 const allowedOrigins = [
   "http://localhost:3000",
   process.env.FRONTEND_URL,
-].filter(Boolean);
+  "https://ai-ebook-frontend-g9xhpa2sc-sengundarp-1268s-projects.vercel.app",
+].filter(Boolean).map((url) => url.trim().replace(/\/+$/, ""));
+
+// CORS configuration
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests without an Origin header
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      const normalizedOrigin = origin.trim().replace(/\/+$/, "");
+
+      if (allowedOrigins.includes(normalizedOrigin)) {
+        return callback(null, true);
+      }
+
+      console.error("CORS blocked origin:", origin);
+      console.error("Allowed origins:", allowedOrigins);
+
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 
 // CORS configuration
 app.use(
