@@ -4,9 +4,28 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const Payment = require("../models/Payment");
 
-const GENERATION_PRICES = {
-  outline: 500, // ₹5 in paise
-  chapter: 1000, // ₹10 in paise
+const OUTLINE_PRICE_PER_EXTRA_CHAPTER = 500; // ₹5 in paise
+const FREE_OUTLINE_CHAPTERS = 4;
+const CHAPTER_GENERATION_PRICE = 1000; // ₹10 in paise
+
+const getExpectedOutlineAmount = (chapterCount) =>
+  Math.max(0, chapterCount - FREE_OUTLINE_CHAPTERS) *
+  OUTLINE_PRICE_PER_EXTRA_CHAPTER;
+
+const isValidStoredAmount = (paymentRecord) => {
+  if (paymentRecord.paymentType === "chapter") {
+    return paymentRecord.amount === CHAPTER_GENERATION_PRICE;
+  }
+
+  if (paymentRecord.paymentType === "outline") {
+    return (
+      Number.isInteger(paymentRecord.amount) &&
+      paymentRecord.amount >= OUTLINE_PRICE_PER_EXTRA_CHAPTER &&
+      paymentRecord.amount % OUTLINE_PRICE_PER_EXTRA_CHAPTER === 0
+    );
+  }
+
+  return false;
 };
 
 const getRazorpay = () => {
@@ -28,6 +47,7 @@ const createPaymentOrder = async (req, res) => {
   try {
     const userId = req.user?.userId;
     const { paymentType } = req.body;
+    const chapterCount = Number(req.body.chapterCount);
 
     if (!userId || !mongoose.isValidObjectId(userId)) {
       return res.status(401).json({
@@ -35,16 +55,33 @@ const createPaymentOrder = async (req, res) => {
       });
     }
 
-    if (!Object.prototype.hasOwnProperty.call(
-      GENERATION_PRICES,
-      paymentType
-    )) {
+    if (!["outline", "chapter"].includes(paymentType)) {
       return res.status(400).json({
         message: "paymentType must be outline or chapter.",
       });
     }
 
-    const amount = GENERATION_PRICES[paymentType];
+    let amount;
+
+    if (paymentType === "outline") {
+      if (
+        !Number.isInteger(chapterCount) ||
+        chapterCount <= FREE_OUTLINE_CHAPTERS
+      ) {
+        return res.status(400).json({
+          message:
+            "Outlines with 4 or fewer chapters are free. Paid outline orders require at least 5 chapters.",
+        });
+      }
+
+      amount = getExpectedOutlineAmount(chapterCount);
+      console.log("Chapter count:", chapterCount);
+      console.log("Payment amount in paise:", amount);
+      console.log("Payment amount in rupees:", amount / 100);
+    } else {
+      amount = CHAPTER_GENERATION_PRICE;
+    }
+
     const razorpay = getRazorpay();
 
     const order = await razorpay.orders.create({
@@ -54,6 +91,9 @@ const createPaymentOrder = async (req, res) => {
       notes: {
         userId: userId.toString(),
         paymentType,
+        ...(paymentType === "outline"
+          ? { chapterCount: String(chapterCount) }
+          : {}),
       },
     });
 
@@ -119,7 +159,7 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    // Only find payment orders belonging to the logged-in user.
+    // Only retrieve orders belonging to the authenticated user.
     const paymentRecord = await Payment.findOne({
       user: userId,
       razorpayOrderId: orderId,
@@ -131,12 +171,9 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    // Check the stored price against the server-defined price.
-    const expectedAmount = GENERATION_PRICES[paymentRecord.paymentType];
-
+    // Validate the stored amount and currency.
     if (
-      !expectedAmount ||
-      paymentRecord.amount !== expectedAmount ||
+      !isValidStoredAmount(paymentRecord) ||
       paymentRecord.currency !== "INR"
     ) {
       return res.status(400).json({
@@ -144,7 +181,7 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    // Repeated verification of the same payment is safe.
+    // Make verification retries safe for the same payment.
     if (paymentRecord.status === "paid") {
       if (paymentRecord.razorpayPaymentId === paymentId) {
         return res.status(200).json({
@@ -173,23 +210,12 @@ const verifyPayment = async (req, res) => {
       throw new Error("Razorpay secret is not configured.");
     }
 
-    // Verify the Razorpay signature using the saved order ID.
+    // Verify the Razorpay HMAC signature.
     const expectedSignature = crypto
       .createHmac("sha256", keySecret)
       .update(`${paymentRecord.razorpayOrderId}|${paymentId}`)
       .digest();
 
-      console.log("Razorpay verification diagnostics:", {
-    orderIdReceived: Boolean(orderId),
-     paymentIdReceived: Boolean(paymentId),
-    signatureReceived: Boolean(signature),
-    signatureLength: signature?.length,
-    signatureIsHex: typeof signature === "string"
-        ? /^[a-fA-F0-9]+$/.test(signature)
-        : false,
-    });
-
-    // Reject malformed hexadecimal signatures.
     if (!/^[a-fA-F0-9]{64}$/.test(signature)) {
       return res.status(400).json({
         message: "Invalid payment signature.",
@@ -207,13 +233,13 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    // Confirm payment details directly with Razorpay.
+    // Verify payment details directly with Razorpay.
     const razorpay = getRazorpay();
     const razorpayPayment = await razorpay.payments.fetch(paymentId);
 
     if (
       razorpayPayment.order_id !== paymentRecord.razorpayOrderId ||
-      Number(razorpayPayment.amount) !== expectedAmount ||
+      Number(razorpayPayment.amount) !== paymentRecord.amount ||
       razorpayPayment.currency !== "INR"
     ) {
       return res.status(400).json({
@@ -229,7 +255,8 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    // Atomically mark the order as paid; do not grant a generation here.
+    // Atomically mark the order as paid.
+    // Generation access is granted separately by the access middleware.
     const updatedPayment = await Payment.findOneAndUpdate(
       {
         _id: paymentRecord._id,
@@ -252,7 +279,7 @@ const verifyPayment = async (req, res) => {
     );
 
     if (!updatedPayment) {
-      // Another request may have verified this exact payment.
+      // Handle a concurrent verification request safely.
       const latestPayment = await Payment.findById(paymentRecord._id);
 
       if (
