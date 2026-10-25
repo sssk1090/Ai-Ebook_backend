@@ -1,3 +1,4 @@
+
 const express = require("express");
 
 const {
@@ -13,14 +14,15 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
-// All book routes require authentication for now
+// Public route: anyone can browse public eBooks.
+router.get("/public", getPublicBooks);
+
+// All routes below this line require authentication.
 router.use(authMiddleware);
 
 router.post("/", createBook);
 
 router.get("/my", getMyBooks);
-
-router.get("/public", getPublicBooks);
 
 router.get("/:id", getBookById);
 
