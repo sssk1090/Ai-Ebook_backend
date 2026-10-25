@@ -1,4 +1,3 @@
-
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const AIUsage = require("../models/AIUsage");
@@ -12,8 +11,7 @@ const GENERATION_PRICES = {
   chapter: 1000, // ₹10 in paise
 };
 
-// A reservation left behind by a crashed request can be reclaimed
-// after 30 minutes. Keep this longer than your normal AI request time.
+// An abandoned payment reservation can be reclaimed after 30 minutes.
 const STALE_RESERVATION_MS = 30 * 60 * 1000;
 
 const getOrCreateQuota = async (userId) => {
@@ -56,15 +54,18 @@ const getOrCreateQuota = async (userId) => {
 };
 
 const generationAccessMiddleware = (taskType) => {
-  if (!Object.prototype.hasOwnProperty.call(
-    GENERATION_PRICES,
-    taskType
-  )) {
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      GENERATION_PRICES,
+      taskType
+    )
+  ) {
     throw new Error(`Unsupported generation type: ${taskType}`);
   }
 
   return async (req, res, next) => {
     const userId = req.user?.userId;
+
     const quotaField =
       taskType === "outline" ? "outlineUsed" : "chapterUsed";
 
@@ -72,7 +73,7 @@ const generationAccessMiddleware = (taskType) => {
     let finalized = false;
     let finalizationPromise = null;
 
-    // Release a reservation after a failed generation.
+    // Release reserved quota or payment after failed generation.
     const releaseAccess = async () => {
       if (finalized || !access) return;
 
@@ -93,10 +94,11 @@ const generationAccessMiddleware = (taskType) => {
           );
 
           if (result.matchedCount !== 1) {
-            throw new Error("Could not release free quota reservation.");
+            throw new Error(
+              "Could not release free quota reservation."
+            );
           }
         } else if (access.source === "paid") {
-          // Only the request that owns this reservation can release it.
           const result = await Payment.updateOne(
             {
               _id: access.paymentId,
@@ -116,7 +118,9 @@ const generationAccessMiddleware = (taskType) => {
           );
 
           if (result.matchedCount !== 1) {
-            throw new Error("Could not release payment reservation.");
+            throw new Error(
+              "Could not release payment reservation."
+            );
           }
         }
 
@@ -130,7 +134,7 @@ const generationAccessMiddleware = (taskType) => {
       }
     };
 
-    // Mark a reservation as consumed only after a valid AI result.
+    // Consume a paid generation only after successful AI generation.
     const commitAccess = async () => {
       if (finalized || !access) return;
 
@@ -168,7 +172,7 @@ const generationAccessMiddleware = (taskType) => {
           }
         }
 
-        // A successful free generation remains counted in the quota.
+        // Successful free chapter generations remain counted.
         finalized = true;
       })();
 
@@ -180,13 +184,16 @@ const generationAccessMiddleware = (taskType) => {
     };
 
     try {
+      // Validate authentication.
       if (!userId || !mongoose.isValidObjectId(userId)) {
         return res.status(401).json({
           message: "Valid user authentication is required.",
         });
       }
 
-      // Validate input before reserving quota or payment.
+      let requestedChapterCount;
+
+      // Validate outline details.
       if (taskType === "outline") {
         const {
           title,
@@ -196,23 +203,35 @@ const generationAccessMiddleware = (taskType) => {
           writingStyle,
         } = req.body;
 
-        const count = Number(numberOfChapters);
+        requestedChapterCount = Number(numberOfChapters);
 
         if (
           !title ||
           !topic ||
           !targetAudience ||
           !writingStyle ||
-          !Number.isInteger(count) ||
-          count < 1
+          !Number.isInteger(requestedChapterCount) ||
+          requestedChapterCount < 1
         ) {
           return res.status(400).json({
             message:
               "Provide a title, topic, target audience, positive chapter count and writing style.",
           });
         }
+
+        // RULE: Outlines with 1–4 chapters are always free.
+        // They do not consume the paid-generation quota.
+        if (requestedChapterCount <= 4) {
+          req.generationAccess = {
+            taskType,
+            source: "free",
+          };
+
+          return next();
+        }
       }
 
+      // Validate chapter-generation details.
       if (taskType === "chapter") {
         const {
           title,
@@ -232,32 +251,42 @@ const generationAccessMiddleware = (taskType) => {
           !chapterTitle
         ) {
           return res.status(400).json({
-            message: "Book details and chapter title are required.",
+            message:
+              "Book details and chapter title are required.",
           });
         }
       }
 
+      // Get the quota for chapter generations.
+      // Outlines above 4 chapters always require payment,
+      // regardless of the user's remaining chapter quota.
       const quota = await getOrCreateQuota(userId);
 
       if (!quota) {
         throw new Error("Could not load generation quota.");
       }
 
-      // Atomically reserve a free generation.
-      const reservedQuota = await GenerationQuota.findOneAndUpdate(
-        {
-          userId,
-          [quotaField]: { $lt: FREE_LIMIT },
-        },
-        {
-          $inc: { [quotaField]: 1 },
-        },
-        { new: true }
-      );
+      let reservedQuota = null;
+
+      if (taskType === "chapter") {
+        // Preserve the existing four free chapter generations.
+        reservedQuota = await GenerationQuota.findOneAndUpdate(
+          {
+            userId,
+            [quotaField]: { $lt: FREE_LIMIT },
+          },
+          {
+            $inc: { [quotaField]: 1 },
+          },
+          { new: true }
+        );
+      }
 
       if (reservedQuota) {
         access = { source: "free" };
       } else {
+        // Outlines above 4 chapters and chapters exceeding the
+        // free chapter quota need a verified payment.
         const paymentOrderId = req.body.paymentOrderId;
 
         if (
@@ -267,7 +296,7 @@ const generationAccessMiddleware = (taskType) => {
           return res.status(402).json({
             message:
               taskType === "outline"
-                ? "Your four free outline generations have been used. Pay ₹5 to generate another outline."
+                ? "Outlines with more than 4 chapters require payment. Pay ₹5 to generate this outline."
                 : "Your four free chapter generations have been used. Pay ₹10 to generate another chapter.",
             paymentRequired: true,
             paymentType: taskType,
@@ -279,13 +308,12 @@ const generationAccessMiddleware = (taskType) => {
         }
 
         const requestId = crypto.randomUUID();
+
         const staleBefore = new Date(
           Date.now() - STALE_RESERVATION_MS
         );
 
-        // Claim a verified payment atomically. A payment already
-        // consumed cannot be claimed again. An abandoned reservation
-        // can be reclaimed after the stale-reservation window.
+        // Claim a verified, unused payment atomically.
         const payment = await Payment.findOneAndUpdate(
           {
             user: userId,
@@ -337,8 +365,7 @@ const generationAccessMiddleware = (taskType) => {
 
       const originalJson = res.json.bind(res);
 
-      // Express does not wait for async response wrappers, so this
-      // wrapper handles finalization before sending the JSON response.
+      // Finalize quota/payment before sending the response.
       res.json = function (body) {
         if (finalized) {
           return originalJson(body);
@@ -366,10 +393,9 @@ const generationAccessMiddleware = (taskType) => {
               error.message
             );
 
-            // Do not return generated content if payment/quota
-            // finalization could not be completed safely.
             if (!res.headersSent && !res.destroyed) {
               res.status(500);
+
               originalJson({
                 message:
                   "Unable to finalize this generation. Please check your generation status before retrying.",
@@ -381,8 +407,7 @@ const generationAccessMiddleware = (taskType) => {
         return res;
       };
 
-      // If the client disconnects before the response is complete,
-      // attempt to release the reservation.
+      // Release reservations if the client disconnects early.
       res.on("close", () => {
         if (!res.writableEnded && !finalized) {
           releaseAccess().catch((error) => {
@@ -412,7 +437,8 @@ const generationAccessMiddleware = (taskType) => {
 
       if (!res.headersSent && !res.destroyed) {
         return res.status(500).json({
-          message: "Unable to authorize this generation. Please try again.",
+          message:
+            "Unable to authorize this generation. Please try again.",
         });
       }
     }
