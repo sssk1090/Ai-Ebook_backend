@@ -2,7 +2,9 @@
 const Razorpay = require("razorpay");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
+
 const Payment = require("../models/Payment");
+const Book = require("../models/Book");
 
 const OUTLINE_PRICE_PER_EXTRA_CHAPTER = 500; // ₹5 in paise
 const FREE_OUTLINE_CHAPTERS = 4;
@@ -62,7 +64,9 @@ const createPaymentOrder = async (req, res) => {
     }
 
     let amount;
+    let bookId = null;
 
+    // Outline pricing remains unchanged.
     if (paymentType === "outline") {
       if (
         !Number.isInteger(chapterCount) ||
@@ -75,11 +79,35 @@ const createPaymentOrder = async (req, res) => {
       }
 
       amount = getExpectedOutlineAmount(chapterCount);
-      console.log("Chapter count:", chapterCount);
-      console.log("Payment amount in paise:", amount);
-      console.log("Payment amount in rupees:", amount / 100);
     } else {
+      // Every paid chapter generation costs ₹10.
       amount = CHAPTER_GENERATION_PRICE;
+
+      // Chapter payments must be linked to a valid book.
+      const requestedBookId = req.body.bookId;
+
+      if (
+        !requestedBookId ||
+        !mongoose.isValidObjectId(requestedBookId)
+      ) {
+        return res.status(400).json({
+          message: "A valid book ID is required for chapter payments.",
+        });
+      }
+
+      bookId = new mongoose.Types.ObjectId(requestedBookId);
+
+      // Ensure this book belongs to the logged-in user.
+      const ownedBook = await Book.findOne({
+        _id: bookId,
+        userId,
+      }).select("_id");
+
+      if (!ownedBook) {
+        return res.status(404).json({
+          message: "Book not found.",
+        });
+      }
     }
 
     const razorpay = getRazorpay();
@@ -93,13 +121,15 @@ const createPaymentOrder = async (req, res) => {
         paymentType,
         ...(paymentType === "outline"
           ? { chapterCount: String(chapterCount) }
-          : {}),
+          : { bookId: bookId.toString() }),
       },
     });
 
+    // Store the book ID for chapter payments.
     await Payment.create({
       user: userId,
       paymentType,
+      ...(paymentType === "chapter" ? { bookId } : {}),
       amount,
       currency: "INR",
       razorpayOrderId: order.id,
@@ -118,6 +148,9 @@ const createPaymentOrder = async (req, res) => {
       amount: order.amount,
       currency: order.currency,
       paymentType,
+      ...(paymentType === "chapter"
+        ? { bookId: bookId.toString() }
+        : {}),
     });
   } catch (error) {
     console.error("Create payment order error:", error.message);
@@ -178,6 +211,18 @@ const verifyPayment = async (req, res) => {
     ) {
       return res.status(400).json({
         message: "The stored payment amount or currency is invalid.",
+      });
+    }
+
+    // New chapter payments must be associated with a book.
+    // Legacy chapter payments without bookId cannot authorize new generations.
+    if (
+      paymentRecord.paymentType === "chapter" &&
+      !paymentRecord.bookId
+    ) {
+      return res.status(400).json({
+        message:
+          "This chapter payment is not associated with a book. Create a new payment order.",
       });
     }
 
@@ -256,7 +301,7 @@ const verifyPayment = async (req, res) => {
     }
 
     // Atomically mark the order as paid.
-    // Generation access is granted separately by the access middleware.
+    // The generation middleware grants generation access separately.
     const updatedPayment = await Payment.findOneAndUpdate(
       {
         _id: paymentRecord._id,
@@ -279,7 +324,7 @@ const verifyPayment = async (req, res) => {
     );
 
     if (!updatedPayment) {
-      // Handle a concurrent verification request safely.
+      // Handle concurrent verification requests safely.
       const latestPayment = await Payment.findById(paymentRecord._id);
 
       if (
@@ -304,6 +349,7 @@ const verifyPayment = async (req, res) => {
       orderId,
       paymentId,
       paymentType: updatedPayment.paymentType,
+      bookId: updatedPayment.bookId?.toString() || null,
       amount: updatedPayment.amount,
     });
 

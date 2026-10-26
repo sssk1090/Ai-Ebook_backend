@@ -18,6 +18,15 @@ const paymentSchema = new mongoose.Schema(
       required: true,
     },
 
+    // Book associated with a chapter-generation payment.
+    // Optional for compatibility with outline and historical payments.
+    bookId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Book",
+      default: null,
+      index: true,
+    },
+
     // Amount in paise: ₹5 = 500, ₹10 = 1000
     amount: {
       type: Number,
@@ -57,8 +66,7 @@ const paymentSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Retained for compatibility with the existing payment flow.
-    // True means this payment has already authorized a successful generation.
+    // True when this payment has authorized a successful generation.
     generationGranted: {
       type: Boolean,
       default: false,
@@ -99,7 +107,7 @@ const paymentSchema = new mongoose.Schema(
   }
 );
 
-// A payment ID can be associated with at most one payment record.
+// A Razorpay payment ID can belong to at most one payment record.
 paymentSchema.index(
   { razorpayPaymentId: 1 },
   {

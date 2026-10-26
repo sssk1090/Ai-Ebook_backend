@@ -2,8 +2,9 @@
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 
-const AIUsage = require("../models/AIUsage");
 const GenerationQuota = require("../models/GenerationQuota");
+const BookChapterQuota = require("../models/BookChapterQuota");
+const Book = require("../models/Book");
 const Payment = require("../models/Payment");
 
 const FREE_LIMIT = 4;
@@ -12,23 +13,10 @@ const FREE_OUTLINE_CHAPTERS = 4;
 const OUTLINE_PRICE_PER_EXTRA_CHAPTER = 500; // ₹5 in paise
 const CHAPTER_GENERATION_PRICE = 1000; // ₹10 in paise
 
-// Allow recovery of abandoned reservations after 30 minutes.
 const STALE_RESERVATION_MS = 30 * 60 * 1000;
 
-const getOrCreateQuota = async (userId) => {
-  const [outlineCount, chapterCount] = await Promise.all([
-    AIUsage.countDocuments({
-      userId,
-      taskType: "outline",
-      status: "success",
-    }),
-    AIUsage.countDocuments({
-      userId,
-      taskType: "chapter",
-      status: "success",
-    }),
-  ]);
-
+// Create or retrieve the existing user-level outline quota.
+const getOrCreateOutlineQuota = async (userId) => {
   try {
     return await GenerationQuota.findOneAndUpdate(
       { userId },
@@ -54,6 +42,33 @@ const getOrCreateQuota = async (userId) => {
   }
 };
 
+// Create or retrieve the quota for one specific book.
+const getOrCreateBookQuota = async (userId, bookId) => {
+  try {
+    return await BookChapterQuota.findOneAndUpdate(
+      { userId, bookId },
+      {
+        $setOnInsert: {
+          userId,
+          bookId,
+          chapterUsed: 0,
+        },
+      },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+  } catch (error) {
+    if (error.code === 11000) {
+      return BookChapterQuota.findOne({ userId, bookId });
+    }
+
+    throw error;
+  }
+};
+
 const generationAccessMiddleware = (taskType) => {
   if (!["outline", "chapter"].includes(taskType)) {
     throw new Error(`Unsupported generation type: ${taskType}`);
@@ -62,14 +77,12 @@ const generationAccessMiddleware = (taskType) => {
   return async (req, res, next) => {
     const userId = req.user?.userId;
 
-    const quotaField =
-      taskType === "outline" ? "outlineUsed" : "chapterUsed";
-
+    let bookId = null;
+    let quota = null;
     let access = null;
     let finalized = false;
     let finalizationPromise = null;
 
-    // Release a reservation when generation fails.
     const releaseAccess = async () => {
       if (finalized || !access) return;
 
@@ -78,22 +91,41 @@ const generationAccessMiddleware = (taskType) => {
       }
 
       finalizationPromise = (async () => {
+        // Release a reserved free generation if AI generation failed.
         if (access.source === "free" && access.reservedQuota) {
-          const result = await GenerationQuota.updateOne(
-            {
-              userId,
-              [quotaField]: { $gt: 0 },
-            },
-            {
-              $inc: { [quotaField]: -1 },
-            }
-          );
+          let result;
+
+          if (taskType === "chapter") {
+            result = await BookChapterQuota.updateOne(
+              {
+                userId,
+                bookId,
+                chapterUsed: { $gt: 0 },
+              },
+              {
+                $inc: { chapterUsed: -1 },
+              }
+            );
+          } else {
+            result = await GenerationQuota.updateOne(
+              {
+                userId,
+                outlineUsed: { $gt: 0 },
+              },
+              {
+                $inc: { outlineUsed: -1 },
+              }
+            );
+          }
 
           if (result.matchedCount !== 1) {
-            throw new Error("Could not release free quota reservation.");
+            throw new Error(
+              "Could not release the free generation reservation."
+            );
           }
         }
 
+        // Release a paid reservation so a failed generation can be retried.
         if (access.source === "paid") {
           const result = await Payment.updateOne(
             {
@@ -128,7 +160,6 @@ const generationAccessMiddleware = (taskType) => {
       }
     };
 
-    // Mark a paid generation as consumed only after successful generation.
     const commitAccess = async () => {
       if (finalized || !access) return;
 
@@ -138,6 +169,7 @@ const generationAccessMiddleware = (taskType) => {
       }
 
       finalizationPromise = (async () => {
+        // Mark payment as consumed only after successful AI generation.
         if (access.source === "paid") {
           const result = await Payment.updateOne(
             {
@@ -166,7 +198,7 @@ const generationAccessMiddleware = (taskType) => {
           }
         }
 
-        // Successful free generations remain counted.
+        // Successful free reservations remain counted.
         finalized = true;
       })();
 
@@ -185,9 +217,7 @@ const generationAccessMiddleware = (taskType) => {
         });
       }
 
-      let requestedChapterCount;
-
-      // 2. Validate outline details and apply outline pricing.
+      // 2. Validate outline details and preserve outline pricing.
       if (taskType === "outline") {
         const {
           title,
@@ -197,7 +227,7 @@ const generationAccessMiddleware = (taskType) => {
           writingStyle,
         } = req.body;
 
-        requestedChapterCount = Number(numberOfChapters);
+        const requestedChapterCount = Number(numberOfChapters);
 
         if (
           !title ||
@@ -213,8 +243,7 @@ const generationAccessMiddleware = (taskType) => {
           });
         }
 
-        // Outlines containing 1–4 chapters are free.
-        // This rule is independent of chapter-content generation quota.
+        // The first four outline chapters remain free.
         if (requestedChapterCount <= FREE_OUTLINE_CHAPTERS) {
           req.generationAccess = {
             taskType,
@@ -223,9 +252,17 @@ const generationAccessMiddleware = (taskType) => {
 
           return next();
         }
+
+        quota = await getOrCreateOutlineQuota(userId);
+
+        if (!quota) {
+          throw new Error("Could not load outline quota.");
+        }
+
+        req.requestedChapterCount = requestedChapterCount;
       }
 
-      // 3. Validate chapter-content generation details.
+      // 3. Validate chapter generation and book ownership.
       if (taskType === "chapter") {
         const {
           title,
@@ -234,6 +271,7 @@ const generationAccessMiddleware = (taskType) => {
           numberOfChapters,
           writingStyle,
           chapterTitle,
+          bookId: requestedBookId,
         } = req.body;
 
         if (
@@ -249,34 +287,56 @@ const generationAccessMiddleware = (taskType) => {
             message: "Book details and chapter title are required.",
           });
         }
+
+        if (
+          !requestedBookId ||
+          !mongoose.isValidObjectId(requestedBookId)
+        ) {
+          return res.status(400).json({
+            message: "A valid book ID is required.",
+          });
+        }
+
+        bookId = new mongoose.Types.ObjectId(requestedBookId);
+
+        // A user can generate content only for their own book.
+        const ownedBook = await Book.findOne({
+          _id: bookId,
+          userId,
+        }).select("_id");
+
+        if (!ownedBook) {
+          return res.status(404).json({
+            message: "Book not found.",
+          });
+        }
+
+        quota = await getOrCreateBookQuota(userId, bookId);
+
+        if (!quota) {
+          throw new Error("Could not load book chapter quota.");
+        }
       }
 
-      // 4. Calculate the exact server-side payment amount.
+      // 4. Calculate the required payment on the server.
       const requiredAmount =
         taskType === "outline"
-          ? (requestedChapterCount - FREE_OUTLINE_CHAPTERS) *
+          ? (req.requestedChapterCount - FREE_OUTLINE_CHAPTERS) *
             OUTLINE_PRICE_PER_EXTRA_CHAPTER
           : CHAPTER_GENERATION_PRICE;
 
-      // 5. Load the quota record.
-      const quota = await getOrCreateQuota(userId);
-
-      if (!quota) {
-        throw new Error("Could not load generation quota.");
-      }
-
-      // 6. Reserve a free chapter-content generation atomically.
-      // Outline requests above four chapters always require payment.
+      // 5. Reserve a free chapter generation atomically for this book.
       let reservedQuota = null;
 
       if (taskType === "chapter") {
-        reservedQuota = await GenerationQuota.findOneAndUpdate(
+        reservedQuota = await BookChapterQuota.findOneAndUpdate(
           {
             userId,
-            [quotaField]: { $lt: FREE_LIMIT },
+            bookId,
+            chapterUsed: { $lt: FREE_LIMIT },
           },
           {
-            $inc: { [quotaField]: 1 },
+            $inc: { chapterUsed: 1 },
           },
           { new: true }
         );
@@ -288,7 +348,7 @@ const generationAccessMiddleware = (taskType) => {
           reservedQuota: true,
         };
       } else {
-        // 7. No free chapter generations remain, or this is a paid outline.
+        // 6. No free chapter quota remains, or this is a paid outline.
         const paymentOrderId = req.body.paymentOrderId;
 
         if (
@@ -298,8 +358,8 @@ const generationAccessMiddleware = (taskType) => {
           return res.status(402).json({
             message:
               taskType === "outline"
-                ? `This ${requestedChapterCount}-chapter outline costs ₹${requiredAmount / 100}. The first 4 chapters are free; each additional chapter costs ₹5.`
-                : "Your four free chapter generations have been used. Pay ₹10 to generate another chapter.",
+                ? `This ${req.requestedChapterCount}-chapter outline costs ₹${requiredAmount / 100}. The first 4 chapters are free; each additional chapter costs ₹5.`
+                : "Your four free chapter generations for this book have been used. Pay ₹10 to generate another chapter.",
             paymentRequired: true,
             paymentType: taskType,
             pricePaise: requiredAmount,
@@ -308,7 +368,11 @@ const generationAccessMiddleware = (taskType) => {
               taskType === "outline"
                 ? FREE_OUTLINE_CHAPTERS
                 : FREE_LIMIT,
-            used: quota[quotaField],
+            used:
+              taskType === "outline"
+                ? quota.outlineUsed
+                : quota.chapterUsed,
+            bookId: taskType === "chapter" ? String(bookId) : undefined,
           });
         }
 
@@ -317,23 +381,29 @@ const generationAccessMiddleware = (taskType) => {
           Date.now() - STALE_RESERVATION_MS
         );
 
-        // 8. Claim a verified payment for this user, type and exact amount.
-        // Atomic update prevents the same payment being used concurrently.
+        // 7. Claim a verified, unused payment atomically.
+        // Chapter payments must match the exact book as well as the user.
+        const paymentFilter = {
+          user: userId,
+          paymentType: taskType,
+          razorpayOrderId: paymentOrderId,
+          status: "paid",
+          currency: "INR",
+          amount: requiredAmount,
+          generationGranted: false,
+          $or: [
+            { generationInProgress: false },
+            { generationInProgress: { $exists: false } },
+            { generationReservedAt: { $lt: staleBefore } },
+          ],
+        };
+
+        if (taskType === "chapter") {
+          paymentFilter.bookId = bookId;
+        }
+
         const payment = await Payment.findOneAndUpdate(
-          {
-            user: userId,
-            paymentType: taskType,
-            razorpayOrderId: paymentOrderId,
-            status: "paid",
-            currency: "INR",
-            amount: requiredAmount,
-            generationGranted: false,
-            $or: [
-              { generationInProgress: false },
-              { generationInProgress: { $exists: false } },
-              { generationReservedAt: { $lt: staleBefore } },
-            ],
-          },
+          paymentFilter,
           {
             $set: {
               generationInProgress: true,
@@ -347,7 +417,7 @@ const generationAccessMiddleware = (taskType) => {
         if (!payment) {
           return res.status(402).json({
             message:
-              "A verified, unused payment for the exact generation type and amount is required.",
+              "A verified, unused payment for this user, book, generation type and exact amount is required.",
             paymentRequired: true,
             paymentType: taskType,
             pricePaise: requiredAmount,
@@ -356,7 +426,10 @@ const generationAccessMiddleware = (taskType) => {
               taskType === "outline"
                 ? FREE_OUTLINE_CHAPTERS
                 : FREE_LIMIT,
-            used: quota[quotaField],
+            used:
+              taskType === "outline"
+                ? quota.outlineUsed
+                : quota.chapterUsed,
           });
         }
 
@@ -372,7 +445,7 @@ const generationAccessMiddleware = (taskType) => {
         source: access.source,
       };
 
-      // 9. Commit or release access before sending the AI response.
+      // 8. Commit or release the reservation based on the AI response.
       const originalJson = res.json.bind(res);
 
       res.json = function (body) {
