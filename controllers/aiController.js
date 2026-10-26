@@ -67,22 +67,41 @@ const getAISettings = async () => {
 // CHECK WHETHER GROQ FALLBACK IS REQUIRED
 // ====================================================
 
+
 const shouldUseGroq = (error) => {
   const status =
-    error?.status ||
-    error?.statusCode ||
+    error?.status ??
+    error?.statusCode ??
     error?.response?.status;
 
-  const code = error?.code;
+  const code = String(error?.code || "").toLowerCase();
 
   const message = String(
     error?.message || ""
   ).toLowerCase();
 
-  return (
+  const networkErrorCodes = [
+    "econnreset",
+    "econnrefused",
+    "econnaborted",
+    "etimedout",
+    "enotfound",
+    "eai_again",
+    "und_err_connect_timeout",
+    "und_err_headers_timeout",
+    "und_err_socket",
+  ];
+
+  const isNetworkError =
+    message.includes("fetch failed") ||
+    message.includes("network error") ||
+    message.includes("timeout") ||
+    networkErrorCodes.includes(code);
+
+  const isRateLimitOrAvailabilityError =
     Number(status) === 429 ||
-    Number(code) === 429 ||
     Number(status) === 503 ||
+    Number(code) === 429 ||
     Number(code) === 503 ||
     message.includes("429") ||
     message.includes("503") ||
@@ -90,9 +109,14 @@ const shouldUseGroq = (error) => {
     message.includes("quota exceeded") ||
     message.includes("unavailable") ||
     message.includes("high demand") ||
-    message.includes("overloaded")
+    message.includes("overloaded");
+
+  return (
+    isNetworkError ||
+    isRateLimitOrAvailabilityError
   );
 };
+
 
 // ====================================================
 // RETRY GEMINI FOR TEMPORARY 503 ERRORS
@@ -107,8 +131,8 @@ const executeWithGeminiRetry = async (
       return await apiCall();
     } catch (error) {
       const status =
-        error?.status ||
-        error?.statusCode ||
+        error?.status ??
+        error?.statusCode ??
         error?.response?.status;
 
       const code = error?.code;
