@@ -35,8 +35,8 @@ const getOrCreateQuota = async (userId) => {
       {
         $setOnInsert: {
           userId,
-          outlineUsed: outlineCount,
-          chapterUsed: chapterCount,
+          outlineUsed: 0,
+          chapterUsed: 0,
         },
       },
       {
